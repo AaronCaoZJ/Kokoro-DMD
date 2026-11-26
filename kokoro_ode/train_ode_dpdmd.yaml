@@ -1,0 +1,136 @@
+# Training config for the ODE-rollout DMD2 family (DMD2 / DMDO / DP-DMD / TDM / PDD / ODE-init).
+#
+# Same format as train_config.yaml: every key is exported as an environment variable of the same name and read by
+# config_kokoro_dmd2.py via os.environ. Variables already set on the command line or in the environment take precedence.
+# Launch with kokoro_ode/launch_arm.sh (ARM=A|B|C|D|TDM|PDD|ODEINIT|ODEINIT_TDM|ODEINIT_PDD). The launcher exports the
+# per-arm method switches itself, so the values in the "arm switches" section below are only defaults.
+
+# ── Model ────────────────────────────────────────────────────────────────────
+BAGEL_CKPT_DIR: ${BAGEL_MODEL_DIR}            # base BAGEL directory: llm/vit configs, tokenizer, VAE (ae)
+BAGEL_CKPT_PATH: ${TEACHER_CKPT}
+#   ↑ Teacher: CFG-distilled BAGEL checkpoint with cfg_text / cfg_img embeddings.
+#     Student and fake score are initialised from the same weights but run without the CFG embedding.
+PRETRAINED_STUDENT_NET_PATH: ""
+MAX_LATENT_SIZE: 128
+
+# Teacher CFG (applied through the teacher's CFG embedding in a single forward). The embedding was trained on text 1–5, img 1–2.5.
+GUIDANCE_SCALE: 4.0            # cfg_text. The teacher's guidance is fairly weak (velocity gain ≈ 0.2); 5.0 (top of the range) is an option
+CFG_IMG_TEACHER: 2.0           # cfg_img for i2i
+
+# ── Data ─────────────────────────────────────────────────────────────────────
+DATA_YAML: kokoro_ode/data_mainline_1024.yaml   # Z-Image pack data mix; when set, CFG_DISTILL_YAML is ignored
+CFG_DISTILL_YAML: ""
+KOKORO_HELDOUT_BLOCKLIST: ${HELDOUT_DIR}/blocklist.txt
+
+# ── Student sampling schedule (same for every arm) ───────────────────────────
+STUDENT_SAMPLE_STEPS: 4
+STUDENT_T_LIST: "0.999,0.9,0.75,0.5,0.0"       # shift-3 table: uniform 1/.75/.5/.25 warped by shift 3, as in BAGEL inference; the last step starts at 0.5.
+                                               #   The older shift-5 Wan table 0.999,0.937,0.833,0.624 is only used by runs pinned to it in launch_arm.sh
+STUDENT_FIRST_STEP_WEIGHT: 1.0
+
+# ── Arm switches (defaults = arm B; launch_arm.sh overrides them per arm) ────
+#   arm | STUDENT_ROLLOUT | DMD_NOISE  | DPDMD | meaning
+#   A   | real_noised     | fresh      | 0     | DMD2 baseline: student input = real image + fresh noise (SDE marginal); inference is ODE
+#   B   | ode             | fresh      | 0     | DMD2 + ODE rollout: the student rolls out from pure noise along t_list to a random exit step, then takes one step with gradients
+#   C   | ode             | trajectory | 0     | B + Hyper-Bagel DMDO: VSD / fake-score noising reuses the trajectory's own x_T instead of fresh noise
+#   D   | ode             | fresh      | 1     | DP-DMD: all 4 steps from pure noise (detached after step 1); step 1 is aligned with a teacher anchor
+#   TDM | ode (+ DMD_TARGET=landing)           | compares the landing point of the current step, only inside that step's noise interval [t_{i+1}, t_i)
+#   ODEINIT | ODE_INIT=1, STUDENT_UPDATE_FREQ=1  | regresses onto the endpoints of online teacher ODE trajectories; the exported student initialises other arms via PRETRAINED_STUDENT_NET_PATH
+STUDENT_ROLLOUT: ode           # real_noised | ode
+ROLLOUT_EXIT: uniform          # arms B/C: exit step k ~ uniform{0..3}, drawn on rank 0 and broadcast (every FSDP rank must run the same number of forwards)
+FAKE_INPUT: matched            # matched | final. matched = the fake score trains on samples from the same distribution as the student update: B/C = x̂0 at a freshly drawn exit step (as in Self-Forcing);
+                               #   D = the final 4-step output; TDM = x_τ noised from the landing point; A = real image noised → one student step.
+                               #   final = B/C train the fake score on the full 4-step output (same distribution only when ROLLOUT_EXIT=last)
+DMD_NOISE: fresh               # fresh | trajectory
+DMD_TARGET: clean              # clean | landing (TDM)
+TDM_MIN_T: 0.02                # lower bound of the TDM per-step interval (TDM demo: lowt=20/1000); last step τ ∈ [0.02, t_3 − 0.01)
+TDM_MAX_MARGIN: 0.01           # upper bound of the TDM interval: τ < t_k − 0.01 (demo: upt = t_g − 10)
+TDM_HUBER_C: 1e-3              # c of the TDM generator's pseudo-Huber loss (TDM README --use_huber); 0 = mse/w
+TDM_FAKE_W_FLOOR: 1.0           # TDM fake-score weight min(1,5/SNR)·max((1−τ)², f): 1 = min(1,5/SNR) only, 0 = TDM demo weighting, 0.25 = in between
+#   TDM updates fake score and student 1:1 (the demo updates each once per iteration): launch_arm.sh sets STUDENT_UPDATE_FREQ=2
+DPDMD: 0                       # 1 = DP-DMD student step
+DPDMD_DIV_WEIGHT: 0.05         # λ (paper default)
+DPDMD_TEACHER_STEPS: 40        # total steps of the teacher anchor trajectory, shift 3 (as in BAGEL inference); CFG as above
+DPDMD_K_ANCHOR: 10             # paper default 5, the official script passes 10. Step 10 of 40 at shift 3 lands at t=0.9, the landing point of the student's
+                               #   first step on the shift-3 table, so the anchor lines up with student step 1 (on the shift-5 table: step 5 of 30 = 0.9375)
+DPDMD_GRAD_STEPS: after_first  # gradients flow through steps 2..4 (paper / official code); fall back to last (only the final step has gradients) if memory is short
+VSD_NORM: x0                   # VSD normaliser: x0 = 1/mean|x − x̂_real| (DMD2); xt = 1/mean|x_t − x̂_real| (original DP-DMD).
+                               #   Their ratio mean|x_t − x̂_real| / mean|x − x̂_real| = τ·mean|v_real| / mean|x − x̂_real| varies with τ;
+                               #   arm D follows the official code and uses xt (λ=0.05 was tuned under xt); set by launch_arm.sh
+DPDMD_TEACHER_SHIFT: 3.0       # shift of the teacher anchor grid
+ODE_INIT: 0                    # 1 = ODE-init pre-training stage (requires STUDENT_UPDATE_FREQ=1; the ODEINIT arm in launch_arm.sh sets it)
+ODE_INIT_TEACHER_STEPS: 40     # teacher ODE grid: 40 steps at shift 3, merged with the 4 points of the student t_list (hit exactly) → ~43 teacher forwards per trajectory
+ODE_INIT_TEACHER_SHIFT: 3.0
+ODE_INIT_POINTS: all           # all = regress at all 4 student time points of a trajectory (4 forwards with gradients) | random = sample 1 point (as in CausVid)
+#   launch_arm.sh sets NET_LR=2e-6 for the ODEINIT arm (CausVid wan_causal_ode.yaml)
+
+# ── PDD (parallel decoding distillation, arXiv 2607.26004; the PDD / ODEINIT_PDD arms in launch_arm.sh set PDD=1, STUDENT_UPDATE_FREQ=1) ──
+PDD: 0
+PDD_GRID_STEPS: 128            # fine grid size N (paper: midpoint 128 / euler 256); the student's last layer is replicated N times (bagel.pdd_heads)
+PDD_SHIFT: 3.0                 # grid shift (the paper uses 5 for Qwen-Image); 3 matches the student table: 4-NFE block boundaries = 1 / 0.9 / 0.75 / 0.5 / 0
+PDD_SOLVER: midpoint           # teacher average velocity: midpoint (2 teacher forwards) | euler (1 forward, 2 intervals per block)
+PDD_L_MIN: 0                   # 0 = N/8; PDD_L_MAX 0 = N/2 → usable inference NFE ∈ {2, 4, 8} (the paper's Qwen-Image setting)
+PDD_L_MAX: 0
+
+# ── VSD / fake score (same for every arm) ────────────────────────────────────
+STUDENT_UPDATE_FREQ: 5         # update the student once every 5 iterations and the fake score on the other 4 (official DP-DMD uses 5:1, close to this)
+GAN_LOSS_WEIGHT_GEN: 0.0       # GAN off for all arms: the comparison tests whether the methods stay sharp without a GAN loss
+GAN_R1_REG_WEIGHT: 0.0         #   to enable the GAN, a reasonable start is GAN_LOSS_WEIGHT_GEN=5e-4 with GAN_R1_REG_WEIGHT=0.05
+GAN_R1_REG_ALPHA: 0.1
+# Gradient clipping is fixed at 1.0 for net / fake score / discriminator in config_kokoro_dmd2.py (FastGen default: 10); not exposed as a key.
+# timestep_shift=0.8 (in the KokoroNetwork config) only applies in Bagel.forward (packed training path); distillation goes through
+#   _forward_flow_train, which does not use it. Student and teacher both operate on the raw t ∈ [0, 1].
+
+# ── Precision / conditioning fixes (all arms; set a key to 0 to disable it) ──
+OPTIM_FP32_MASTER: 1           # optimizer keeps fp32 master weights + fp32 moments (AdamWMaster). With pure bf16 in-place updates,
+                               #   half an ulp at |w| ~ 0.02 is ≈ 6e-5 > the lr 1e-5 step, so most weights never move
+EMA_FP32_SHADOW: 1             # EMA accumulates trainable params in fp32 (local FSDP shard, ~6.5 GB/GPU); a bf16 lerp has a dead zone of ~ulp/(2(1−β))
+COND_KV_PER_ROLE: 1            # i2i: teacher / fake score prefill the reference-image KV with their own weights (the reference-image VAE prefix goes through moe_gen, which the student trains)
+VSD_T_SHIFT: 5.0               # shift of the VSD noising τ distribution (τ ∈ [0.001, 0.999]); arm D uses 3 as in official DP-DMD, set by launch_arm.sh
+NET_BETAS: "0.9,0.999"         # Adam betas; the TDM arm uses 0,0.95 (demo), set by launch_arm.sh
+FAKE_SCORE_BETAS: "0.9,0.999"
+
+# ── Optimisation ─────────────────────────────────────────────────────────────
+NET_LR: 1e-5
+NET_WARMUP_STEPS: 10
+FAKE_SCORE_LR: 2e-5
+FAKE_SCORE_WARMUP_STEPS: 50
+DISC_LR: 1e-5
+DISC_WARMUP_STEPS: 50
+BATCH_SIZE_GLOBAL: 32          # 1 image per GPU per forward (single-timestep constraint); with 4 GPUs → 8 accumulation rounds per iteration
+PRECISION: bfloat16
+PRECISION_AMP: bfloat16
+SEED: 42
+USE_EMA: 1                     # halflife EMA; the EMA copy is not sharded, ~28 GB extra per GPU
+EMA_RAMPUP_RATIO: ""           # empty = default 0.05 (halflife 500 kimg).
+                               #   Within 3000 iterations the rampup dominates: halflife ≈ 0.05 × images seen, i.e. ~150 iterations at iteration 3000
+FSDP_META_INIT: 1
+
+# ── Scale / schedule ─────────────────────────────────────────────────────────
+# An 8-GPU node runs two arms in parallel, 4 GPUs each (4-GPU FSDP2 with four 14.7B model copies).
+NPROC_PER_NODE: 4              # informational: launch_arm.sh takes the process count from GPUS
+MAX_ITER: 1000                 # every method trains for the same number of iterations on the same data, so arms are compared at equal training steps
+LOGGING_ITER: 25
+SAMPLE_LOGGING_ITER: 30        # in-training 4-step preview (under FSDP this is the raw student, not the EMA). Images appear only at multiples of the arm's STUDENT_UPDATE_FREQ (5/6/2/1)
+SAVE_CKPT_ITER: 250            # each save takes ~6 min; DCP ~230 GB (only the latest is kept) + exported student/ema ~55 GB (all kept)
+EXPORT_SAFETENSORS: 1
+VALIDATION_ITER: 100000        # no val loader; evaluation is done offline (below)
+CKPT_SUBDIR: checkpoints
+
+# ── Evaluation (offline sampling after each checkpoint) ──────────────────────
+EVAL_CASES: ${HELDOUT_DIR}/cases.jsonl   # 15 held-out cases (5 i2i + 5 photoreal + 5 anime)
+EVAL_SEEDS: "0,1,2,3"          # 4 seeds per case, to judge both sharpness and diversity
+EVAL_NFE: 4
+# Comparison grid: the multi-step teacher (CFG embedding 4/2) on the left, then each arm by step count; metrics: high-frequency energy relative to the teacher, LPIPS between seeds of the same prompt
+
+# ── Output / logging ─────────────────────────────────────────────────────────
+FASTGEN_OUTPUT_ROOT: runs/kokoro_dmd_ode   # run dir = <root>/<WANDB_PROJECT>/<WANDB_GROUP>/<WANDB_NAME>
+WANDB_PROJECT: fastgen          # the API key comes from the environment / ~/.bashrc and is never stored in yaml
+WANDB_GROUP: kokoro-dmd2-ode
+WANDB_NAME: ""                  # launch_arm.sh fills in arm_<ARM>_<MMDD_HHMM>
+WANDB_MODE: online
+WANDB_RUN_ID: new
+
+# ── Host-memory fence (scripts/mem_guard.py) ─────────────────────────────────
+MEM_GUARD: 1
+GUARD_LIMIT_GIB: 1100           # trip threshold on whole-host anonymous memory; keep it below the cgroup limit (which also counts page cache). Two arms on one node share it

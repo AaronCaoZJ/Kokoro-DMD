@@ -1,0 +1,100 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Unified hyper-parameter config (YAML) for Kokoro-Bagel DMD2 distillation.
+#
+# This is the only file to edit when tuning. train_kokoro_dmd2.sh parses it and exports every key
+# as an environment variable of the same name; config_kokoro_dmd2.py then reads them via os.environ.get().
+# Key names = environment variable names (upper case). Variables already set in the environment or on
+# the command line take precedence over this file
+# (e.g. `WANDB_MODE=disabled bash train_kokoro_dmd2.sh` overrides the value here).
+#
+# The GAN loss is on by default (GAN_LOSS_WEIGHT_GEN=1e-3). For pure VSD, set GAN_LOSS_WEIGHT_GEN
+# to 0; no code change is needed.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Model paths (teacher and student share the same initial weights) ─────────
+# Architecture / config directory (llm_config.json + tokenizer + ema.safetensors).
+BAGEL_CKPT_DIR: ${BAGEL_MODEL_DIR}
+# Initial weights for both teacher and student (CFG-distilled checkpoint).
+BAGEL_CKPT_PATH: ${TEACHER_CKPT}
+# Optional: a different initial checkpoint for the student (empty → same as the teacher).
+PRETRAINED_STUDENT_NET_PATH: ""
+# max_latent_size: 64 = up to 1024 px (BAGEL-7B-MoT default), 96 = 1536 px, 128 = 2048 px.
+MAX_LATENT_SIZE: 128
+
+# ── Output directory & W&B ───────────────────────────────────────────────────
+# If the run directory already holds checkpoints, the trainer automatically resumes from the latest one.
+# For a fresh run, or to resume from a different checkpoint:
+#   1) change FASTGEN_OUTPUT_ROOT and WANDB_NAME (the run directory is named after WANDB_NAME);
+#   2) to resume from an existing checkpoint, symlink its eight 0xxxxxx.* files into the new run's
+#      checkpoints/ directory; the trainer's latest_checkpoint() picks it up automatically.
+FASTGEN_OUTPUT_ROOT: outputs/kokoro_dmd2_gan
+# W&B run naming (run directory = FASTGEN_OUTPUT_ROOT/<project>/<group>/<name>).
+WANDB_PROJECT: fastgen
+WANDB_GROUP: kokoro-dmd2
+WANDB_NAME: kokoro-dmd2-gan
+# W&B mode: "online", "offline" or "disabled".
+WANDB_MODE: online
+# Run-ID policy: empty = resume the id stored in wandb_id.txt under the same save_path (recommended for resuming),
+# "new" = fresh run, "<id>" = resume that id.
+WANDB_RUN_ID: ""
+
+# ── Data mix (cfg_distill.yaml = per-source paths / weights / prompt_builder / decoder) ──
+# Precedence: explicit *_WDS_SHARD_DIRS > CFG_DISTILL_YAML > glob over all shards.
+# Leave the three *_WDS_SHARD_DIRS empty to use the yaml data mix.
+DATA_ROOT_DIR: ${DATA_ROOT_DIR}
+CFG_DISTILL_YAML: cfg_distill.yaml
+WDS_SHARD_DIRS: ""
+T2I_WDS_SHARD_DIRS: ""
+I2I_WDS_SHARD_DIRS: ""
+# i2i sampling probability (empty → falls back to i2i_prob in cfg_distill.yaml, default 0.6).
+I2I_PROB: ""
+
+# ── Training schedule ────────────────────────────────────────────────────────
+MAX_ITER: 15000              # maximum training iterations (absolute; a resumed run continues up to this count)
+BATCH_SIZE_GLOBAL: 32        # effective global batch size (grad_accum_rounds is derived from it)
+LOGGING_ITER: 25             # scalar loss logging interval (W&B metrics / console)
+SAMPLE_LOGGING_ITER: 50      # in-training 4-NFE preview interval (W&B images; 0 = off)
+SAVE_CKPT_ITER: 500          # checkpoint interval (a rollback point every 500 iterations)
+VALIDATION_ITER: 100000      # validation interval (no val loader configured; a large value disables it)
+CKPT_SUBDIR: checkpoints     # checkpoint subdirectory (inside the run directory)
+SEED: 42                     # random seed
+USE_EMA: 1                   # enable EMA (halflife schedule); halflife / start_iter etc. are set in the config
+FSDP_META_INIT: 1            # FSDP meta-init (non-zero ranks build on the meta device, rank 0 broadcasts; saves host memory)
+
+# ── Optimizer (learning rates & warmup) ──────────────────────────────────────
+NET_LR: 1e-5                 # student (generator) learning rate
+NET_WARMUP_STEPS: 10
+FAKE_SCORE_LR: 2e-5          # fake-score learning rate
+FAKE_SCORE_WARMUP_STEPS: 50
+DISC_LR: 1e-5                # discriminator learning rate (used when the GAN is on)
+DISC_WARMUP_STEPS: 50
+
+# ── DMD2 / student sampling ──────────────────────────────────────────────────
+STUDENT_UPDATE_FREQ: 5       # update the student every N iterations; fake_score on the others
+STUDENT_SAMPLE_STEPS: 4      # student inference NFE / denoising steps (1 = single-step, 4 = multi-step)
+STUDENT_FIRST_STEP_WEIGHT: 1.0
+
+# ── Teacher CFG (only the teacher uses cfg_embed; student and fake score do not) ──
+GUIDANCE_SCALE: 4.0          # cfg_text
+CFG_IMG_TEACHER: 2.0         # i2i cfg_img
+
+# ── Precision ────────────────────────────────────────────────────────────────
+PRECISION: bfloat16
+PRECISION_AMP: bfloat16
+
+# ── GAN (discriminator on inference-branch features) ─────────────────────────
+# > 0 activates the whole GAN path (discriminator instantiation + generator GAN loss + discriminator GAN loss);
+# = 0 gives pure VSD + DSM.
+GAN_LOSS_WEIGHT_GEN: 1e-3    # generator GAN loss weight; 1e-3 = conservative start (DMD2 default)
+GAN_R1_REG_WEIGHT: 0.0       # R1 regularisation weight; 0 = off (fallback knob: 0.01–1 if the discriminator becomes too strong)
+GAN_R1_REG_ALPHA: 0.1        # R1 perturbation noise scale (DMD2 default 0.1)
+
+# ── Unused variables (exported but not read by the code) ─────────────────────
+# Kept only so that older launch scripts that set them keep working unchanged.
+#   - GAN_LOSS_WEIGHT (old name): superseded by GAN_LOSS_WEIGHT_GEN and no longer read by the config.
+#   - EXPECTED_NUM_TOKENS / MAX_NUM_TOKENS / MAX_NUM_TOKENS_PER_SAMPLE: the active dataloader runs in
+#     single-image mode (batch_size=1) without packed-token batching, so these are unused.
+GAN_LOSS_WEIGHT: 0.0
+EXPECTED_NUM_TOKENS: 51200
+MAX_NUM_TOKENS: 59392
+MAX_NUM_TOKENS_PER_SAMPLE: 20480

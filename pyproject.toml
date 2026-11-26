@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.ruff]
+line-length = 120
+# Verbatim vendored copies of the CFG-distillation reference code's data/*
+# modules — kept byte-identical (random.* call order is replay-sensitive), so
+# excluded from lint/format like third_party.
+extend-exclude = [
+    "fastgen/datasets/kokoro_cfgdistill_data/sample_utils.py",
+    "fastgen/datasets/kokoro_cfgdistill_data/prompt_builders_t2i.py",
+]
+
+[tool.ruff.lint]
+exclude = []

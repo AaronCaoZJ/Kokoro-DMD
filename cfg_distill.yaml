@@ -1,0 +1,112 @@
+# Data mix in the format of the CFG-distillation trainer config. The DMD2 config (config_kokoro_dmd2.py, via
+# CFG_DISTILL_YAML in train_config.yaml) reads only t2i_shards, i2i_shards and i2i_prob; the other keys are the
+# CFG-distillation training settings and are not used by DMD2.
+model_path: ${oc.env:BAGEL_MODEL_DIR,''} # base model
+checkpoint_path: "" # checkpoint to resume training from; empty = none
+teacher_checkpoint_path: ${oc.env:TEACHER_CKPT,''} # teacher checkpoint (ema.safetensors)
+student_checkpoint_path: "" # student weights for a warm restart (a .safetensors file, not a directory)
+output_dir: outputs/cfg_distill
+run_name: cfg-distill # W&B run name
+
+t2i_shards:
+  - path: 
+      - ${oc.env:DATA_ROOT_DIR,''}/danbooru+yande/2026_4_26/danbooru/{000000..000153}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/danbooru+yande/2026_4_26/yande/{000000..000094}.tar
+    weight: 10.0
+    prompt_builder: t2i_danbooru_yande_posttraining
+  - path:  
+      - ${oc.env:DATA_ROOT_DIR,''}/post_training_realpeople_t2i/realpeople/t2i/1pornstars_wds/shard-{000000..000199}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/post_training_realpeople_t2i/realpeople/t2i/日本写真_wds/shard-{000000..000063}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/post_training_realpeople_t2i/realpeople/t2i/ffm_wds/shard-{000000..000023}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/post_training_realpeople_t2i/realpeople/t2i/gangbang_wds/shard-{000000..000023}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/post_training_realpeople_t2i/realpeople/t2i/kink_wds/shard-{000000..000023}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/post_training_realpeople_t2i/realpeople/t2i/xiuren_wds/shard-{000000..000063}.tar
+    weight: 14.0
+    prompt_builder: t2i_realpeople_post_training
+
+i2i_shards:
+  - path: 
+      - ${oc.env:DATA_ROOT_DIR,''}/story/kemono_128/shard-{000000..000127}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/story/ehentai/A+/shard-{000000..000422}.tar
+    weight: 1.0
+    decoder: i2i_story
+    prompt_builder: i2i_story_new
+  - path: 
+      - ${oc.env:DATA_ROOT_DIR,''}/4fuck_wds/shard-{000000..000147}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/coser_wds/shard-{000000..000097}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/model_wds/shard-{000000..000151}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/5fvck_wds/shard-{000000..000567}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/xiuren_wds/shard-{000000..000240}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/ffm_fixed_wds/shard-{000000..000151}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/gal2_new_wds/shard-{000000..000650}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/galgame_new_wds/shard-{000000..000678}.tar
+    weight: 3.0
+    decoder: i2i_story
+    prompt_builder: i2i_story
+  - path: 
+      - ${oc.env:DATA_ROOT_DIR,''}/realpeople_story/1gangbang_story_wds/shard-{000000..000111}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/realpeople_story/1pornstarAB_story_wds/shard-{000000..000983}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/realpeople_story/1pornstars_story_wds/shard-{000000..001559}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/realpeople_story/2ehentai_story_wds/shard-{000000..000240}.tar
+    weight: 3.0
+    decoder: i2i_story
+    prompt_builder: i2i_rp_story_new
+  - path:
+      - ${oc.env:DATA_ROOT_DIR,''}/diff_new/new-{000000..000143}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/diff_new/new-{000145..000238}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/diff_new/new-{000240..000283}.tar
+      - ${oc.env:DATA_ROOT_DIR,''}/diff_new/new-{000285..000452}.tar
+    weight: 0.5
+    decoder: i2i_diff
+    prompt_builder: i2i_diff
+  - path: ${oc.env:DATA_ROOT_DIR,''}/diff_banana/shard-{000000..000207}.tar
+    weight: 0.1
+    decoder: i2i_reverse
+    prompt_builder: i2i_banana
+
+# Flow / CFG ranges
+timestep_shift: 3.0 # timestep shift
+cfg_text_min: 1.0
+cfg_text_max: 5.0   # t2i and i2i text guidance scale
+cfg_img_min: 1.0
+cfg_img_max: 2.5    # i2i image guidance scale only
+i2i_prob: 0.6       # sampled globally per microstep so all ranks use the same modality
+
+# Optimizer
+lr: 5.0e-6
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1.0e-8
+max_grad_norm: 1.0
+
+# Training schedule
+max_steps: 100000
+grad_accum_steps: 4
+warmup_steps: 100
+
+# EMA
+ema_decay: 0.999
+# When resuming, also keep an EMA of the CFG embedder (removes t2i drift); set to false for CFG distillation from scratch.
+cfg_embedder_ema: true
+
+# Logging / saving
+
+log_every: 25
+save_every: 250
+vis_every: 50
+vis_prompt: "ganyu (genshin impact) run on the beach"
+vis_num_steps: 30
+
+# Resume (leave empty for auto-detect latest checkpoint)
+resume_from: ""
+reset_lr_on_resume: false   # true: replace the checkpoint's LR with `lr` above, without re-running warmup
+
+# Misc
+seed: 42
+mixed_precision: bf16
+activation_checkpointing: true
+optimizer_offload: false
+wandb_project: bagel-cfg-distill
+# wandb_mode: offline
+wandb_mode: online
