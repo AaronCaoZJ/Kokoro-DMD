@@ -16,8 +16,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from fastgen.configs.config import SampleTConfig
-from fastgen.methods.distribution_matching import kokoro_dmd2_ode as ode_mod
-from fastgen.methods.distribution_matching.kokoro_dmd2_ode import KokoroDMD2ODE, shifted_grid
+from fastgen.methods.distribution_matching import kokoro_dpdmd as dpdmd_mod
+from fastgen.methods.distribution_matching import kokoro_ode_common as common_mod
+from fastgen.methods.distribution_matching import kokoro_pdd as pdd_mod
+from fastgen.methods.distribution_matching.kokoro_dmd2_ode import KokoroDMD2ODE
+from fastgen.methods.distribution_matching.kokoro_ode_common import shifted_grid
 from fastgen.networks.network import FastGenNetwork
 
 D = 64          # patch_dim
@@ -227,11 +230,11 @@ def test_D_detach_and_gradient_routing(grad_steps):
         captured.setdefault("div", out)            # the first mse_loss in the student step is the diversity term
         return out
 
-    ode_mod.F.mse_loss = spy_mse
+    dpdmd_mod.F.mse_loss = spy_mse
     try:
         loss_map, out = m._dpdmd_student_step(noise, torch.randn(n_tok(), D), cond())
     finally:
-        ode_mod.F.mse_loss = real_mse
+        dpdmd_mod.F.mse_loss = real_mse
     student = [c for c in m.net.calls if c["role"] == "student"]
     expect = [True, True, True, True] if grad_steps == "after_first" else [True, False, False, True]
     assert [c["grad"] for c in student] == expect
@@ -274,11 +277,11 @@ def test_D_anchor_target():
             captured["target"] = b
         return real_mse(a, b, *args, **kw)
 
-    ode_mod.F.mse_loss = spy_mse
+    dpdmd_mod.F.mse_loss = spy_mse
     try:
         m._dpdmd_student_step(noise, torch.randn(n_tok(), D), cond())
     finally:
-        ode_mod.F.mse_loss = real_mse
+        dpdmd_mod.F.mse_loss = real_mse
     torch.testing.assert_close(captured["target"], v_target)
 
 
@@ -450,7 +453,7 @@ def test_invalid_switches(bad):
 def _exit_worker(rank, port, out):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     dist.init_process_group("gloo", rank=rank, world_size=2)
-    ode_mod.world_size = lambda: dist.get_world_size()   # fastgen's world_size() is always 1 on CPU
+    common_mod.world_size = lambda: dist.get_world_size()   # fastgen's world_size() is always 1 on CPU
     torch.manual_seed(1000 + rank)                       # different RNG state per rank
     m = make_method(student_rollout="ode")
     ks = [m._sample_exit_step(4) for _ in range(64)]
@@ -467,7 +470,8 @@ def test_exit_step_broadcast():
 
 # ── 11. PDD ───────────────────────────────────────────────────────────────────
 
-from fastgen.methods.distribution_matching.kokoro_dmd2_ode import pdd_advance, pdd_grid, pdd_sample, ode_sample  # noqa: E402
+from fastgen.methods.distribution_matching.kokoro_ode_common import ode_sample  # noqa: E402
+from fastgen.methods.distribution_matching.kokoro_pdd import pdd_advance, pdd_grid, pdd_sample  # noqa: E402
 
 PDD_KW = dict(pdd=True, pdd_grid_steps=32, pdd_shift=5.0, student_update_freq=1)
 
@@ -520,11 +524,11 @@ def test_pdd_step(solver, n_start):
         ks_seen["perm"] = out
         return out
 
-    ode_mod.torch.randperm = spy_perm
+    pdd_mod.torch.randperm = spy_perm
     try:
         loss_map, out = m.single_train_step(sample_batch(), iteration=3)
     finally:
-        ode_mod.torch.randperm = real_perm
+        pdd_mod.torch.randperm = real_perm
     grid = pdd_grid(32, 5.0)
     student = [c for c in m.net.calls if c["role"] == "student"]
     assert [c["grad"] for c in student] == [False] * (n_start // 4) + [True]
@@ -554,7 +558,7 @@ def test_pdd_loss_value_midpoint():
     grid = pdd_grid(32, 5.0)
     torch.manual_seed(5)
     real_perm = torch.randperm
-    ode_mod.torch.randperm = lambda n, *a, **kw: torch.arange(n).roll(-3)   # k = 3
+    pdd_mod.torch.randperm = lambda n, *a, **kw: torch.arange(n).roll(-3)   # k = 3
     captured = {}
     real_heads = m._pdd_heads
 
@@ -568,7 +572,7 @@ def test_pdd_loss_value_midpoint():
     try:
         loss_map, _ = m.single_train_step(sample_batch(), iteration=3)
     finally:
-        ode_mod.torch.randperm = real_perm
+        pdd_mod.torch.randperm = real_perm
     u = captured["u"].detach()
     x_k = captured["x_n"] + sum((grid[l + 1] - grid[l]) * u[:, l] for l in range(0, 3))
     h = grid[4] - grid[3]
@@ -603,7 +607,7 @@ def test_tdm_generator_loss_formula(c):
 def test_tdm_fake_weight_floor():
     """f = 1 is the default weight, f = 0 is equivalent to the reference demo's weight, and f = 0.25 matches
     the demo for τ ≤ 0.5 and is floored at 0.25 above that."""
-    from fastgen.methods.distribution_matching.kokoro_dmd2_ode import tdm_fake_weight
+    from fastgen.methods.distribution_matching.kokoro_tdm import tdm_fake_weight
     for tau in (0.07, 0.1, 0.3, 0.5, 0.75, 0.9, 0.95, 0.989):
         snr = ((1 - tau) / tau) ** 2
         assert tdm_fake_weight(tau, 1.0) == pytest.approx(min(1.0, 5.0 / snr))

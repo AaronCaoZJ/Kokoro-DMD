@@ -601,7 +601,7 @@ class KokoroDMD2(DMD2Model):
 
         # ── 3. Fake score prediction (no cfg embed, no grad) ─────────────────
         # fake / teacher output v and x0 = x_t − t·v is rebuilt in fp32 (same as
-        # KokoroDMD2ODE._fake_teacher_x0).  Asking the network for x0 rounds each
+        # kokoro_ode_common.ODECommonMixin._fake_teacher_x0).  Asking the network for x0 rounds each
         # x0 to bf16 (ulp 0.004–0.008) before fake − teacher, and the bf16
         # pseudo-target then drops small score differences.
         tau = t.float().unsqueeze(-1)

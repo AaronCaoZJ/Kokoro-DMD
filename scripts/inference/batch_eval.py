@@ -182,7 +182,7 @@ def load_model(model_dir: str, ckpt_path: str, *, use_ema: bool, role: str,
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Generation (ode uses kokoro_dmd2_ode.ode_sample, the same function as the training
+# Generation (ode uses kokoro_ode_common.ode_sample, the same function as the training
 # rollout; sde uses a simple bf16 loop)
 # ──────────────────────────────────────────────────────────────────────────
 def _resolve_t_list(cfg, device, dtype):
@@ -276,7 +276,7 @@ def generate(net, *, task_type, prompt, source_image, cfg, role, device):
         if getattr(net, "pdd_grid_steps", 0) > 0 and role == "student":
             # PDD: fine N-cell grid (same shift as training), one forward per block,
             # NFE = num_steps (same pdd_sample as training)
-            from fastgen.methods.distribution_matching.kokoro_dmd2_ode import pdd_grid, pdd_sample
+            from fastgen.methods.distribution_matching.kokoro_pdd import pdd_grid, pdd_sample
             grid = pdd_grid(net.pdd_grid_steps, float(cfg.get("pdd_shift", 5.0)))
             block = net.pdd_grid_steps // int(cfg["num_steps"])
             noise = torch.randn(n_vae, patch_dim, device=device, dtype=torch.float32)
@@ -287,7 +287,7 @@ def generate(net, *, task_type, prompt, source_image, cfg, role, device):
         elif sample_type == "ode":
             # Same integrator as the training rollout (KokoroDMD2ODE / ode_sample): Euler with
             # fp32 state and t quantized to network precision
-            from fastgen.methods.distribution_matching.kokoro_dmd2_ode import ode_sample, quantize_t
+            from fastgen.methods.distribution_matching.kokoro_ode_common import ode_sample, quantize_t
             t_vals = [quantize_t(v, model_dtype) for v in t_list.tolist()]
             noise = torch.randn(n_vae, patch_dim, device=device, dtype=torch.float32)
             x_pred = ode_sample(net, noise, t_vals, cond, model_dtype, role=role)

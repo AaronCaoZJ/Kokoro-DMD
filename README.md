@@ -6,7 +6,8 @@ Few-step distillation of the [BAGEL](https://github.com/ByteDance-Seed/Bagel) un
 |---|---|
 | `fastgen/networks/kokoro/` | BAGEL network (Qwen2 MoT LLM, SigLIP ViT, VAE) wrapped as a FastGen network |
 | `fastgen/methods/distribution_matching/kokoro_dmd2.py` | `KokoroDMD2`: DMD2 (VSD + optional GAN) for BAGEL packed sequences |
-| `fastgen/methods/distribution_matching/kokoro_dmd2_ode.py` | `KokoroDMD2ODE`: all variants in section 2.1, selected by switches |
+| `fastgen/methods/distribution_matching/kokoro_dmd2_ode.py` | `KokoroDMD2ODE`: entry class for the variants in section 2.1 (switch validation and dispatch); each method's code is in its own file, listed in the *Code* column of 2.1 |
+| `fastgen/methods/distribution_matching/kokoro_ode_common.py` | helpers shared by those variants: time schedule, ODE rollout / sampling, exit-step broadcast, VSD comparison |
 | `fastgen/datasets/kokoro_*` | data adapters: CFG-distillation shards (default) and the 1024px packed-data pipeline (`DATA_YAML`) |
 | `fastgen/{trainer.py,callbacks,configs,utils}` | minimal FastGen training framework (FSDP2, DCP checkpoints, EMA) |
 | `kokoro_ode/` | launcher (`launch_arm.sh`), configs, two-stage pipeline, CPU unit tests, evaluation |
@@ -25,19 +26,19 @@ Every method below is our implementation.
 
 ## 2.1 BAGEL (`fastgen/`)
 
-Select a variant with `ARM=` in `kokoro_ode/launch_arm.sh`. All variants distill to a 4-step student; other hyper-parameters come from `kokoro_ode/train_ode_dpdmd.yaml`. The notes record what we observed with BAGEL-7B-MoT; nothing here is a tuned benchmark result.
+Select a variant with `ARM=` in `kokoro_ode/launch_arm.sh`. The code files are in `fastgen/methods/distribution_matching/`; all variants run through `KokoroDMD2ODE`, which composes them. All variants distill to a 4-step student; other hyper-parameters come from `kokoro_ode/train_ode_dpdmd.yaml`. The notes record what we observed with BAGEL-7B-MoT; nothing here is a tuned benchmark result.
 
-| ARM | Method | What changes relative to DMD2 | Reference | Notes from our runs |
-|---|---|---|---|---|
-| `A` | DMD2 | Student input is a noised real image | [DMD2](https://arxiv.org/abs/2405.14867) | Over-sharpens with `RECIPE=1`; `RECIPE=2` (shift-3 τ, β2 = 0.95, cosine LR to 0) largely fixes this by our metrics |
-| `B` | DMD2 + ODE rollout | Student input comes from its own Euler rollout from noise to a random exit step (Self-Forcing style); one gradient-carrying step | Self Forcing (Huang et al., 2025) | Leaves a faint high-frequency grid; see section 2.3 for the inference-time fix |
-| `C` | DMDO | `B` + re-noising with the trajectory's own noise; the fake score is fit on rollout end points | [Hyper-Bagel](https://arxiv.org/abs/2509.18824) | Training previews showed heavy contrast and saturation; stopped early |
-| `D` | DP-DMD | The first student step is regressed to a multi-step teacher target; the DMD loss is applied to the later steps; x_t-based VSD normaliser; fake:student = 5:1 | [DP-DMD](https://arxiv.org/abs/2602.03139) | Sharpness closest to the teacher among the DMD variants; `RECIPE=2` reduces the grid artifact by about 20% (metric) |
-| `TDM` | Trajectory Distribution Matching | Compares at each step's landing point and re-noises only inside that step's interval; importance weights; pseudo-Huber loss; fake:student = 1:1 | [TDM](https://arxiv.org/abs/2503.06674) | The fake-weight floor (`TDM_FAKE_W_FLOOR`) gave no measurable gain |
-| `PDD` | Parallel Decoding Distillation | Multi-head output predicts several steps per evaluation; data-free; no fake score | [PDD](https://arxiv.org/abs/2607.26004) | Only run after ODE-init (see `ODEINIT_PDD`) |
-| `ODEINIT` | Teacher-ODE initialisation | Online regression of every student step onto the teacher's ODE trajectory | CausVid-style ODE init | Correct composition but ghosting; used only as an initialisation |
-| `ODEINIT_TDM` | ODE-init → TDM | Two stages via `kokoro_ode/run_odeinit_pipeline.sh` | — | Removes the ODE-init ghosting within a few hundred steps and has the least grid artifact, but is high-contrast. It drifts further from the teacher the longer it trains (closest around 500 steps); teacher CFG 3 and Huber c = 0.1 did not help. An optional first-step anchor (`TDM_ANCHOR_WEIGHT`) is implemented for this case |
-| `ODEINIT_PDD` | ODE-init → PDD | Same as above, with PDD as the second stage | — | **Diverged** at lr 1e-5 with global batch 32: outputs degraded after ~150 steps and collapsed by ~180. Lower learning rates are untested |
+| ARM | Method | Code | What changes relative to DMD2 | Reference | Notes from our runs |
+|---|---|---|---|---|---|
+| `A` | DMD2 | `kokoro_dmd2.py` | Student input is a noised real image | [DMD2](https://arxiv.org/abs/2405.14867) | Over-sharpens with `RECIPE=1`; `RECIPE=2` (shift-3 τ, β2 = 0.95, cosine LR to 0) largely fixes this by our metrics |
+| `B` | DMD2 + ODE rollout | `kokoro_rollout.py` | Student input comes from its own Euler rollout from noise to a random exit step (Self-Forcing style); one gradient-carrying step | Self Forcing (Huang et al., 2025) | Leaves a faint high-frequency grid; see section 2.3 for the inference-time fix |
+| `C` | DMDO | `kokoro_dmdo.py` | `B` + re-noising with the trajectory's own noise; the fake score is fit on rollout end points | [Hyper-Bagel](https://arxiv.org/abs/2509.18824) | Training previews showed heavy contrast and saturation; stopped early |
+| `D` | DP-DMD | `kokoro_dpdmd.py` | The first student step is regressed to a multi-step teacher target; the DMD loss is applied to the later steps; x_t-based VSD normaliser; fake:student = 5:1 | [DP-DMD](https://arxiv.org/abs/2602.03139) | Sharpness closest to the teacher among the DMD variants; `RECIPE=2` reduces the grid artifact by about 20% (metric) |
+| `TDM` | Trajectory Distribution Matching | `kokoro_tdm.py` | Compares at each step's landing point and re-noises only inside that step's interval; importance weights; pseudo-Huber loss; fake:student = 1:1 | [TDM](https://arxiv.org/abs/2503.06674) | The fake-weight floor (`TDM_FAKE_W_FLOOR`) gave no measurable gain |
+| `PDD` | Parallel Decoding Distillation | `kokoro_pdd.py` | Multi-head output predicts several steps per evaluation; data-free; no fake score | [PDD](https://arxiv.org/abs/2607.26004) | Only run after ODE-init (see `ODEINIT_PDD`) |
+| `ODEINIT` | Teacher-ODE initialisation | `kokoro_ode_init.py` | Online regression of every student step onto the teacher's ODE trajectory | CausVid-style ODE init | Correct composition but ghosting; used only as an initialisation |
+| `ODEINIT_TDM` | ODE-init → TDM | `kokoro_ode_init.py` → `kokoro_tdm.py` | Two stages via `kokoro_ode/run_odeinit_pipeline.sh` | — | Removes the ODE-init ghosting within a few hundred steps and has the least grid artifact, but is high-contrast. It drifts further from the teacher the longer it trains (closest around 500 steps); teacher CFG 3 and Huber c = 0.1 did not help. An optional first-step anchor (`TDM_ANCHOR_WEIGHT`) is implemented for this case |
+| `ODEINIT_PDD` | ODE-init → PDD | `kokoro_ode_init.py` → `kokoro_pdd.py` | Same as above, with PDD as the second stage | — | **Diverged** at lr 1e-5 with global batch 32: outputs degraded after ~150 steps and collapsed by ~180. Lower learning rates are untested |
 
 `train_kokoro_dmd2.sh` with `train_config.yaml` runs plain `KokoroDMD2`: DMD2 + GAN on the CFG-distillation data.
 
